@@ -1,47 +1,90 @@
 from pipe.config import Config, VerticalMode
 from pipe.audio_core import AudioProcessor, TimeMapper, Diarizer
-from pipe.transcription import MasterIndexer
+from pipe.transcription import MasterIndexer, SubtitleGenerator
 from pipe.visual_core import VisualAnalyzer
 from pipe.renderer import SubtitleRenderer
-# from renderer import Renderer # (Assume you move your existing burn logic here)
-import torch
-import gc, subprocess, os
-HF_TOKEN = os.getenv("HF_ACCESS_TOKEN") 
+from pipe.utils import cleanup_gpu, get_video_duration, FFmpegWrapper
+import gc
+import json
+import os
+from pathlib import Path
+
+HF_TOKEN = os.getenv("HF_ACCESS_TOKEN")
+
 def main(input_video: str):
     print(f"=== Processing: {input_video} ===")
     
-    # 1. Audio Extraction
+    # --- Define Paths for Caching ---
     raw_audio_path = Config.TEMP_DIR / "raw_audio.wav"
-    # (Add extraction logic here or in AudioProcessor)
-    wav_tensor = AudioProcessor.load_audio(input_video)
-    
-    # 2. Diarization (Who is speaking when?)
-    # Returns: [(start, end, speaker_label)]
-    diarization_segments = Diarizer.process(wav_tensor, HF_TOKEN)
-    
-    # 2. VAD & TimeMap (The Fix)
-    print("Generating TimeMap...")
-    keep_segments = AudioProcessor.get_vad_segments(wav_tensor)
-    time_mapper = TimeMapper(keep_segments)
-    
-    # 3. Create Clean Audio for Whisper
     clean_audio_path = Config.TEMP_DIR / "clean_whisper.wav"
-    AudioProcessor.create_clean_audio(input_video, keep_segments, clean_audio_path)
+    vad_segments_path = Config.TEMP_DIR / "vad_segments.json"
+    diarization_path = Config.TEMP_DIR / "diarization.json"
+    master_index_path = Config.OUTPUT_DIR / "master_index.json"
     
-    # 4. Transcribe & Index
-    # This index now contains RAW timestamps, perfectly synced to the original video
-    master_index = MasterIndexer.create_index(clean_audio_path, time_mapper)
-    MasterIndexer.inject_speakers(master_index, diarization_segments)
-    MasterIndexer.save_index(master_index, Config.OUTPUT_DIR / "master_index.json")
+    # --- PHASE 1: AUDIO & TRANSCRIPTION (With Resume Logic) ---
     
+    # 1. Check for Master Index (The "Done" State)
+    if master_index_path.exists() and vad_segments_path.exists():
+        print("-> Found existing Master Index & VAD data. Loading from cache...")
+        master_index = MasterIndexer.load_index(master_index_path)
+        keep_segments = AudioProcessor.load_segments(vad_segments_path)
+        time_mapper = TimeMapper(keep_segments)
+    else:
+        # 2. Raw Audio Extraction
+        if raw_audio_path.exists():
+            print("-> Found cached raw audio.")
+        else:
+            print("-> Extracting raw audio...")
+            AudioProcessor.extract_raw_audio(input_video, raw_audio_path)
+        
+        # 3. VAD (Voice Activity Detection)
+        if vad_segments_path.exists():
+            print("-> Found cached VAD segments.")
+            keep_segments = AudioProcessor.load_segments(vad_segments_path)
+        else:
+            print("-> Running VAD...")
+            wav_tensor = AudioProcessor.load_audio(raw_audio_path)
+            keep_segments = AudioProcessor.get_vad_segments(wav_tensor)
+            AudioProcessor.save_segments(keep_segments, vad_segments_path)
+            del wav_tensor
+            gc.collect()
+            
+        time_mapper = TimeMapper(keep_segments)
+        
+        # 4. Clean Audio for Whisper
+        if clean_audio_path.exists():
+            print("-> Found cached clean audio.")
+        else:
+            print("-> Creating clean audio...")
+            # Use FFmpegWrapper for audio segment concatenation
+            AudioProcessor.create_clean_audio(str(raw_audio_path), keep_segments, clean_audio_path)
+            
+        # 5. Diarization
+        diarization_segments = []
+        if diarization_path.exists():
+            print("-> Found cached Diarization.")
+            with open(diarization_path, 'r') as f:
+                diarization_segments = json.load(f)
+        else:
+            print("-> Running Diarization...")
+            # Diarizer now accepts path to save memory
+            diarization_segments = Diarizer.process(str(raw_audio_path), HF_TOKEN)
+            with open(diarization_path, 'w') as f:
+                json.dump(diarization_segments, f)
+        
+        # 6. Transcribe & Index
+        print("-> Transcribing & Indexing...")
+        master_index = MasterIndexer.create_index(clean_audio_path, time_mapper)
+        MasterIndexer.inject_speakers(master_index, diarization_segments)
+        MasterIndexer.save_index(master_index, master_index_path)
 
-    # --- PHASE 3: LOGIC & FILTERING ---
+    # --- PHASE 2: LOGIC & FILTERING ---
     
     recap_segments = []
     highlight_segments = []
     
     print("--- Applying Logic Filters ---")
-    for i, seg in enumerate(master_index):
+    for seg in master_index:
         text = seg['text'].lower()
         duration = seg['end'] - seg['start']
         
@@ -50,112 +93,131 @@ def main(input_video: str):
             seg['tags'].append('recap')
             recap_segments.append(seg)
             
-        # Path 2 Logic: "Highlights" (Heuristic + Visual Placeholder)
-        # Only check segments > 5s and < 60s
-        # if 5.0 < duration < 60.0:
-        #     score = VisualAnalyzer.get_candidate_score(seg, input_video)
-        #     if score >= 1: # Low threshold for demo
-        #         seg['tags'].append('highlight')
-        #         highlight_segments.append(seg)
+        # Path 2 Logic: "Highlights"
+        # TODO: Future Enhancement - Replace placeholder with VisualAnalyzer.get_candidate_score()
+        # This is where the "Highlight Finder" logic will be expanded:
+        # - Extract keyframes from video segments
+        # - Analyze visual features (action detection, scene changes, etc.)
+        # - Score segments based on visual interest + audio energy
+        # - Apply ML-based ranking for true highlight detection
+        if 5.0 < duration < 60.0:
+            score = 1  # Placeholder for VisualAnalyzer.get_candidate_score(seg, input_video)
+            if score >= 1:
+                seg['tags'].append('highlight')
+                highlight_segments.append(seg)
 
-
-
-
-
-    # # 5. Logic: Find Highlights (Example)
-    # # We load vLLM ONCE here to manage VRAM
-    # # llm = LLM(model=Config.VLLM_MODEL_ID) 
-    # print(master_index)
-    # print("Searching for highlights... In NEED OF HEAVY REFACTORING")
-    # highlights = []
-    # for segment in master_index:
-    #     # Pre-filter: Only check segments > 5 seconds with "laughter" in text (simple heuristic)
-    #     duration = segment['end'] - segment['start']
-    #     if duration > 5 and "a" in segment['text'].lower():
-            
-    #         # score = VisualAnalyzer.analyze_highlight(
-    #         #     input_video, segment['text'], segment['start'], segment['end'], llm_engine=llm
-    #         # )
-    #         score = 8 # Placeholder
-            
-    #         if score > 7:
-    #             segment['tags'].append('highlight')
-    #             highlights.append(segment)
-    
-
-    # Unload vLLM
-    # del llm
+    # Aggressive Memory Cleanup After Heavy Indexing Phase
+    print("-> Cleaning up memory before rendering phase...")
+    cleanup_gpu()
     gc.collect()
-    torch.cuda.empty_cache()
 
-    # --- PHASE 4: RENDERING ---
+    # --- PHASE 3: RENDERING (With Resume Logic) ---
     
-    # Path 1.1: Last Recap Segment -> 9:16
+    # Path 1.1: Recap -> 9:16 Vertical Format
     if recap_segments:
-        last_recap = [recap_segments[-1]] # List of 1 dict
-        print(f"Found {len(recap_segments)} recaps. Rendering last one.")
+        last_recap = recap_segments[-1]
+        output_recap = Config.OUTPUT_DIR / f"{Path(input_video).stem}_recap_9_16.mp4"
         
-        # Generate ASS
-        ass_path = Config.TEMP_DIR / "recap.ass"
-        SubtitleRenderer.create_hormozi_ass(last_recap, str(ass_path), is_vertical=True)
+        if output_recap.exists():
+            print(f"-> Skipping Recap (Exists): {output_recap}")
+        else:
+            print(f"\n--- Path 1.1: Rendering Recap ({last_recap['start']:.2f}s - {last_recap['end']:.2f}s) ---")
+            
+            # 1. Generate ASS subtitles
+            ass_path = Config.TEMP_DIR / "recap.ass"
+            SubtitleRenderer.create_hormozi_ass([last_recap], str(ass_path), is_vertical=True)
+            
+            # 2. Extract segment using FFmpegWrapper
+            temp_trim = Config.TEMP_DIR / "temp_recap_raw.mp4"
+            FFmpegWrapper.trim_segment(
+                input_path=input_video,
+                output_path=str(temp_trim),
+                start=last_recap['start'],
+                end=last_recap['end'],
+                desc="Extracting Recap",
+                copy_streams=True  # Fast stream copy
+            )
+            
+            # 3. Burn subtitles and verticalize
+            SubtitleRenderer.burn_subtitles(
+                str(temp_trim), 
+                str(ass_path), 
+                str(output_recap), 
+                mode=VerticalMode.BLUR_BG  # Change to SPLIT_SCREEN if Config.FACECAM_COORDS is set
+            )
+            print(f"-> Recap saved to {output_recap}")
+
+    # Path 1.2: Clean Long-form (No Silence, No Recaps)
+    output_clean = Config.OUTPUT_DIR / f"{Path(input_video).stem}_clean_16_9.mp4"
+    srt_path = output_clean.with_suffix(".srt")
+    
+    if output_clean.exists() and srt_path.exists():
+        print(f"-> Skipping Clean Video & SRT (Exists): {output_clean}")
+    else:
+        print(f"\n--- Path 1.2: Rendering Clean Long-form ---")
         
-        # Cut & Burn
-        # Note: We need to trim the video to this segment first, then burn.
-        # For simplicity in this script, we'll just burn the specific segment.
-        # In a full prod env, you'd use the 'render_batch' logic from your original script 
-        # adapted to take specific start/end times.
+        # 1. Calculate intervals to keep (VAD segments - Recap segments)
+        recap_ranges = [(r['start'], r['end']) for r in recap_segments]
+        final_intervals = time_mapper.get_clean_intervals(keep_segments, recap_ranges)
         
-        # Simplified: Just print the action for now
-        print(f"-> Ready to render Recap: {last_recap[0]['start']} - {last_recap[0]['end']}")
+        # 2. Use FFmpegWrapper to concatenate video segments directly
+        FFmpegWrapper.concat_video_segments(
+            input_path=input_video,
+            segments=final_intervals,
+            output_path=str(output_clean),
+            desc="Creating Clean Video"
+        )
+        print(f"-> Clean video saved to {output_clean}")
         
+        # 3. Generate SRT subtitles for the clean video
+        print("-> Generating SRT subtitles...")
+        SubtitleGenerator.generate_srt(master_index, final_intervals, str(srt_path))
+        print(f"-> SRT subtitles saved to {srt_path}")
+
     # Path 2.1: Highlights -> 9:16 Shorts
-    print(f"Found {len(highlight_segments)} highlights.")
+    print(f"\n--- Processing {len(highlight_segments)} Highlights ---")
     for i, highlight in enumerate(highlight_segments):
-        print(f"-> Rendering Highlight {i+1}: {highlight['text'][:30]}...")
+        output_path = Config.OUTPUT_DIR / f"highlight_{i}.mp4"
+        if output_path.exists():
+            print(f"-> Skipping Highlight {i} (Exists)")
+            continue
+            
+        print(f"-> Rendering Highlight {i+1}: {highlight['text'][:50]}...")
         
-        # 1. Create ASS for this specific segment
+        # 1. Generate ASS subtitles
         ass_path = Config.TEMP_DIR / f"highlight_{i}.ass"
         SubtitleRenderer.create_hormozi_ass([highlight], str(ass_path), is_vertical=True)
         
-        # 2. Determine Crop Coordinates (Facecam or Active Speaker)
-        # If we had facecam coords in Config:
-        coords = Config.FACECAM_COORDS
-        
-        # 3. Render
-        output_path = Config.OUTPUT_DIR / f"highlight_{i}.mp4"
-        
-        # We need to trim the video AND burn subs. 
-        # FFmpeg complex filter: trim -> split -> (bg/fg logic) -> burn -> out
-        # This is complex to construct dynamically. 
-        # Strategy: Trim to temp file -> Burn.
-        
+        # 2. Extract highlight segment using FFmpegWrapper
         temp_trim = Config.TEMP_DIR / f"temp_trim_{i}.mp4"
+        FFmpegWrapper.trim_segment(
+            input_path=input_video,
+            output_path=str(temp_trim),
+            start=highlight['start'],
+            end=highlight['end'],
+            desc=f"Extracting Highlight {i+1}",
+            copy_streams=True  # Fast stream copy
+        )
         
-        # Fast Seek Trim
-        cmd_trim = [
-            "ffmpeg", "-y", "-v", "error",
-            "-ss", str(highlight['start']),
-            "-to", str(highlight['end']),
-            "-i", input_video,
-            "-c:v", "copy", "-c:a", "copy",
-            str(temp_trim)
-        ]
-        subprocess.run(cmd_trim)
-        
-        # Burn
+        # 3. Burn subtitles and verticalize
         SubtitleRenderer.burn_subtitles(
             str(temp_trim), 
             str(ass_path), 
             str(output_path), 
-            mode=VerticalMode.BLUR_BG # Or SPLIT_SCREEN if coords exist
+            mode=VerticalMode.BLUR_BG  # Or SPLIT_SCREEN if Config.FACECAM_COORDS is set
         )
+        
+        print(f"-> Highlight {i+1} saved to {output_path}")
+        
+        # Clean up temp file
+        if temp_trim.exists():
+            temp_trim.unlink()
 
-
-    # 6. Render
-    # Now you pass 'highlights' to your Renderer class
-    # The Renderer uses segment['start'] and segment['end'] which are RAW VIDEO times.
-    # It cuts, crops, and burns subs.
-    # print(f"Found {len(highlights)} highlights. Ready to render.")
+    print("\n=== Processing Complete ===")
+    print(f"Outputs saved to: {Config.OUTPUT_DIR}")
+    
+    # Final cleanup
+    cleanup_gpu()
 
 if __name__ == "__main__":
     main("sloppyshorts-1.mp4")

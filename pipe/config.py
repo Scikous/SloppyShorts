@@ -8,6 +8,9 @@ class VerticalMode(Enum):
     SPLIT_SCREEN = "split_screen"
 
 class Config:
+    # Flow Control
+    CLEAN_RUN = False
+
     # Paths
     TEMP_DIR = Path("temp_process")
     OUTPUT_DIR = Path("output")
@@ -30,3 +33,16 @@ class Config:
     # Create dirs
     TEMP_DIR.mkdir(exist_ok=True)
     OUTPUT_DIR.mkdir(exist_ok=True)
+
+class Artifacts:
+    @staticmethod
+    def get_raw_audio(temp_dir: Path) -> Path:
+        return temp_dir / "raw_audio.wav"
+    
+    @staticmethod
+    def get_clean_audio(temp_dir: Path) -> Path:
+        return temp_dir / "clean_whisper.wav"
+    
+    @staticmethod
+    def get_master_index(output_dir: Path) -> Path:
+        return output_dir / "master_index.json"

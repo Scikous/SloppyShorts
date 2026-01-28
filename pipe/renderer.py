@@ -1,8 +1,8 @@
 import pysubs2
 from pysubs2 import SSAEvent, SSAStyle, Color
 from typing import List, Tuple
-from pipe.config import Config, VerticalMode
-from pipe.utils import run_ffmpeg_with_progress, get_video_duration
+from pipe.config import VerticalMode
+from pipe.utils import FFmpegWrapper, get_video_duration
 
 class SubtitleRenderer:
     @staticmethod
@@ -39,7 +39,6 @@ class SubtitleRenderer:
         )
         subs.styles["Hormozi"] = style
 
-        # Flatten all words from the selected segments
         all_words = []
         for seg in master_index_segments:
             if 'words' in seg:
@@ -47,12 +46,10 @@ class SubtitleRenderer:
 
         buffer = []
         for word_data in all_words:
-            # word_data is expected to be {'word': str, 'start': float, 'end': float}
             buffer.append(word_data)
             txt = word_data['word'].strip()
             is_end = txt[-1] in ".?!," if txt else False
             
-            # Logic: Group words until punctuation or max 2 words
             if len(buffer) >= 2 or is_end:
                 start_ms = int(buffer[0]['start'] * 1000)
                 end_ms = int(buffer[-1]['end'] * 1000)
@@ -61,7 +58,6 @@ class SubtitleRenderer:
                 subs.events.append(SSAEvent(start=start_ms, end=end_ms, text=text_content, style="Hormozi"))
                 buffer = []
         
-        # Flush remaining buffer
         if buffer:
             start_ms = int(buffer[0]['start'] * 1000)
             end_ms = int(buffer[-1]['end'] * 1000)
@@ -109,23 +105,18 @@ class SubtitleRenderer:
         else:
             vf_chain = "null"
 
+        # Escape the path for FFmpeg filter
+        escaped_ass = str(ass_path).replace("\\", "/").replace(":", "\\:")
+        
         if vf_chain == "null":
-            full_vf = f"ass={ass_path}, setsar=1"
+            full_vf = f"ass='{escaped_ass}', setsar=1"
         else:
-            # Escape the path for FFmpeg filter
-            escaped_ass = str(ass_path).replace("\\", "/").replace(":", "\\:")
             full_vf = f"{vf_chain}[v_final];[v_final]ass='{escaped_ass}', setsar=1"
 
-        cmd = [
-            "ffmpeg", "-y", 
-            "-hwaccel", "cuda",
-            "-i", str(video_path),
-            "-filter_complex", full_vf,
-            "-c:v", "h264_nvenc",
-            "-preset", "p4",
-            "-cq", "23",
-            "-c:a", "copy",
-            str(output_path)
-        ]
-        
-        run_ffmpeg_with_progress(cmd, total_duration, desc=f"Burning ({mode.name})")
+        FFmpegWrapper.render_with_filter(
+            input_path=video_path,
+            output_path=output_path,
+            filter_complex=full_vf,
+            duration=total_duration,
+            desc=f"Burning ({mode.name})"
+        )
