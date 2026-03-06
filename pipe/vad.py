@@ -22,12 +22,13 @@ class VADProcessor:
         )
         
         segments =[]
-        padding = 0.2 
+        post_padding = 0.2  
+        pre_padding = 0.1 # <--- ADD 100ms padding BEFORE speech to anchor timestamps context
         max_dur = len(audio_tensor) / Config.SAMPLE_RATE_WHISPER
         
         for ts in speech_ts:
-            start = max(0, ts['start'] - padding)
-            end = min(max_dur, ts['end'] + padding)
+            start = max(0.0, ts['start'] - pre_padding) 
+            end = min(max_dur, ts['end'] + post_padding)
             if segments and start < segments[-1][1]:
                 segments[-1] = (segments[-1][0], max(segments[-1][1], end))
             else:

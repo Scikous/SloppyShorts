@@ -70,7 +70,7 @@ class SubtitleGenerator:
 
 class VideoRenderer:
     @staticmethod
-    def render_recap(input_video: str, recap_segments: List[dict], master_index: List[dict]):
+    def render_recap(input_video: str, recap_segments: List[dict], master_index: List[dict], time_mapper, keep_segments: List[tuple]):
         if not recap_segments:
             return
             
@@ -87,31 +87,51 @@ class VideoRenderer:
         recap_sequence = master_index[last_recap_idx:]
         total_video_duration = get_video_duration(input_video)
         
+        # Filter keep_segments to only include portions from last_recap start onwards
+        recap_keep_segments = []
+        for seg_start, seg_end in keep_segments:
+            if seg_end <= last_recap['start']:
+                continue  # Segment is entirely before recap
+            clipped_start = max(seg_start, last_recap['start'])
+            clipped_end = min(seg_end, total_video_duration)
+            if clipped_start < clipped_end:
+                recap_keep_segments.append((clipped_start, clipped_end))
+        
+        # Generate ASS with adjusted timestamps (relative to the concatenated video timeline)
         ass_path = Config.TEMP_DIR / "recap.ass"
         SubtitleRenderer.create_hormozi_ass(
-            recap_sequence, 
-            str(ass_path), 
+            recap_sequence,
+            str(ass_path),
             is_vertical=True,
             start_offset=last_recap['start']
         )
         
-        temp_trim = Config.TEMP_DIR / "temp_recap_raw.mp4"
-        FFmpegWrapper.trim_segment(
+        # Use concat_video_segments to remove silence gaps
+        temp_concat = Config.TEMP_DIR / "temp_recap_concat.mp4"
+        FFmpegWrapper.concat_video_segments(
             input_path=input_video,
-            output_path=str(temp_trim),
-            start=last_recap['start'],
-            end=total_video_duration,
-            desc="Extracting Recap",
-            copy_streams=True
+            segments=recap_keep_segments,
+            output_path=str(temp_concat),
+            desc="Creating Recap (silence removed)"
+        )
+        
+        # Adjust subtitle timestamps to match the concatenated timeline
+        SubtitleRenderer.adjust_timestamps_for_concat(
+            str(ass_path),
+            recap_keep_segments,
+            last_recap['start']
         )
         
         SubtitleRenderer.burn_subtitles(
-            str(temp_trim), 
-            str(ass_path), 
-            str(output_recap), 
+            str(temp_concat),
+            str(ass_path),
+            str(output_recap),
             mode=VerticalMode.BLUR_BG
         )
         print(f"-> Recap saved to {output_recap}")
+        
+        if temp_concat.exists():
+            temp_concat.unlink()
 
     @staticmethod
     def render_clean_longform(input_video: str, time_mapper, keep_segments: List[tuple], recap_segments: List[dict], master_index: List[dict]):
@@ -200,6 +220,6 @@ class VideoRenderer:
                     
         cleanup_gpu()
 
-        cls.render_recap(input_video, recap_segments, master_index)
+        cls.render_recap(input_video, recap_segments, master_index, time_mapper, keep_segments)
         cls.render_clean_longform(input_video, time_mapper, keep_segments, recap_segments, master_index)
         cls.render_highlights(input_video, highlight_segments)

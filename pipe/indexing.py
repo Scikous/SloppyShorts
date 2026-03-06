@@ -10,15 +10,23 @@ class MasterIndexer:
         master_index =[]
         
         for seg in transcription_data:
+            # Sentence segments CAN span gaps. Map bounds normally.
             raw_start = time_mapper.clean_to_raw(seg['start'])
             raw_end = time_mapper.clean_to_raw(seg['end'])
             
-            words = []
-            for w in seg.get('words',[]):
+            words =[]
+            for w in seg.get('words', []):
+                clean_w_start = w['start']
+                clean_w_end = w['end']
+                
+                # Words SHOULD NOT span gaps. Map both bounds using the offset of the word's midpoint.
+                w_mid = (clean_w_start + clean_w_end) / 2.0
+                w_offset = time_mapper.get_offset(w_mid)
+                
                 words.append({
                     "word": w['word'],
-                    "start": time_mapper.clean_to_raw(w['start']),
-                    "end": time_mapper.clean_to_raw(w['end']),
+                    "start": clean_w_start + w_offset,
+                    "end": clean_w_end + w_offset,
                     "probability": w.get('probability', 0.0)
                 })
             
