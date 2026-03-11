@@ -11,15 +11,16 @@ from pipe.diarization import Diarizer
 from pipe.transcription import Transcriber
 from pipe.indexing import MasterIndexer
 from pipe.rendering import VideoRenderer
+from pipe.recap_detector import RecapDetector
 
 HF_TOKEN = os.getenv("HF_ACCESS_TOKEN")
 
 def process_video(
-    input_video: str, 
-    run_vad=True, 
-    run_diarization=True, 
-    run_transcription=True, 
-    run_indexing=True, 
+    input_video: str,
+    run_vad=True,
+    run_diarization=True,
+    run_transcription=True,
+    run_indexing=True,
     run_rendering=True
 ):
     print(f"=== Processing Pipeline: {input_video} ===")
@@ -31,6 +32,7 @@ def process_video(
     diarization_path = Config.TEMP_DIR / "diarization.json"
     transcription_path = Config.TEMP_DIR / "transcription.json"
     master_index_path = Config.OUTPUT_DIR / "master_index.json"
+    recap_info_path = Config.TEMP_DIR / "recap_info.json"
 
     # --- Phase 1: Audio Extraction ---
     if not raw_audio_path.exists():
@@ -39,13 +41,50 @@ def process_video(
     else:
         print("-> Found cached raw audio.")
 
-    # --- Phase 2: VAD ---
-    keep_segments =[]
-    if run_vad:
-        keep_segments = VADProcessor.run(str(raw_audio_path), str(vad_segments_path))
+    # --- Phase 0: Recap Detection (NEW - Before VAD) ---
+    if not recap_info_path.exists():
+        print("\n--- Phase 0: Recap Detection ---")
+        spike_time, final_recap_segment = RecapDetector.run(str(raw_audio_path))
+        
+        # Save recap info for caching
+        import json
+        recap_info = {
+            "spike_time": spike_time,
+            "final_recap_segment": list(final_recap_segment) if final_recap_segment else None
+        }
+        with open(recap_info_path, 'w') as f:
+            json.dump(recap_info, f)
     else:
-        keep_segments = VADProcessor.load_segments(str(vad_segments_path))
+        print("\n--- Phase 0: Recap Detection (Cached) ---")
+        import json
+        with open(recap_info_path, 'r') as f:
+            recap_info = json.load(f)
+        spike_time = recap_info["spike_time"]
+        final_recap_segment = tuple(recap_info["final_recap_segment"]) if recap_info["final_recap_segment"] else None
+        
+    print(f"[Recap Info] Spike time: {spike_time:.2f}s")
+    if final_recap_segment:
+        print(f"[Recap Info] Final recap segment: {final_recap_segment[0]:.2f}s - {final_recap_segment[1]:.2f}s")
+    else:
+        print("[Recap Info] No recap segment detected")
+
+    # --- Phase 2: VAD ---
+    all_vad_segments = []
+    if run_vad:
+        all_vad_segments = VADProcessor.run(str(raw_audio_path), str(vad_segments_path))
+    else:
+        all_vad_segments = VADProcessor.load_segments(str(vad_segments_path))
         print("-> Loaded cached VAD segments.")
+    
+    # Filter VAD segments: main content (before spike) + final recap segment only
+    if final_recap_segment:
+        main_segments = RecapDetector.filter_main_segments(all_vad_segments, spike_time)
+        keep_segments = main_segments + [final_recap_segment]
+        print(f"[Recap Info] Final keep_segments: {len(main_segments)} main + 1 recap = {len(keep_segments)} total")
+    else:
+        # No recap detected, use all VAD segments as-is
+        keep_segments = all_vad_segments
+        print("[Recap Info] Using all VAD segments (no recap)")
         
     time_mapper = TimeMapper(keep_segments)
 
@@ -100,7 +139,7 @@ def process_video(
     # --- Phase 7: Rendering ---
     if run_rendering:
         if master_index and keep_segments:
-            VideoRenderer.run(input_video, master_index, time_mapper, keep_segments)
+            VideoRenderer.run(input_video, master_index, time_mapper, keep_segments, final_recap_segment)
         else:
             print("-> Missing master index or VAD segments required for rendering.")
 

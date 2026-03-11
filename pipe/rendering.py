@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 from pipe.config import Config, VerticalMode
 from pipe.utils import get_video_duration, FFmpegWrapper, cleanup_gpu
 from pipe.renderer import SubtitleRenderer
@@ -70,7 +70,7 @@ class SubtitleGenerator:
 
 class VideoRenderer:
     @staticmethod
-    def render_recap(input_video: str, recap_segments: List[dict], master_index: List[dict], time_mapper, keep_segments: List[tuple]):
+    def render_recap(input_video: str, recap_segments: List[dict], master_index: List[dict], time_mapper, keep_segments: List[tuple], final_recap_segment: Optional[Tuple[float, float]] = None):
         if not recap_segments:
             return
             
@@ -80,22 +80,50 @@ class VideoRenderer:
         if output_recap.exists():
             print(f"-> Skipping Recap (Exists): {output_recap}")
             return
-            
-        print(f"\n--- Path 1.1: Rendering Recap ({last_recap['start']:.2f}s - end of video) ---")
         
-        last_recap_idx = master_index.index(last_recap)
-        recap_sequence = master_index[last_recap_idx:]
+        # FIX: Use final_recap_segment times if provided, otherwise fall back to last_recap from master_index
+        # This ensures we use the actual detected clap/recap times instead of VAD segment times
+        if final_recap_segment:
+            recap_start = final_recap_segment[0]
+            recap_end = final_recap_segment[1]
+            print(f"\n--- Path 1.1: Rendering Recap using final_recap_segment ({recap_start:.2f}s - {recap_end:.2f}s) ---")
+        else:
+            recap_start = last_recap['start']
+            recap_end = last_recap['end']
+            print(f"\n--- Path 1.1: Rendering Recap using master_index ({recap_start:.2f}s - end of video) ---")
+        
+        # Filter master_index segments to only include those whose END time is >= recap_start
+        # This prevents subtitles from before the clap from appearing at the start of the recap video
+        recap_sequence = [seg for seg in master_index if seg['end'] >= recap_start and seg['start'] < recap_end]
+        
+        # Further filter words within each segment to exclude those ending before recap_start
+        filtered_recap_sequence = []
+        for seg in recap_sequence:
+            if 'words' in seg:
+                # Only keep words that start after recap_start (or overlap with it)
+                valid_words = [w for w in seg['words'] if w['start'] >= recap_start - 0.1]  # Small tolerance for timing variations
+                if valid_words:
+                    filtered_seg = seg.copy()
+                    filtered_seg['words'] = valid_words
+                    filtered_recap_sequence.append(filtered_seg)
+            else:
+                filtered_recap_sequence.append(seg)
+        
+        recap_sequence = filtered_recap_sequence
+        
         total_video_duration = get_video_duration(input_video)
         
-        # Filter keep_segments to only include portions from last_recap start onwards
+        # Filter keep_segments to only include portions from recap_start onwards
         recap_keep_segments = []
         for seg_start, seg_end in keep_segments:
-            if seg_end <= last_recap['start']:
+            if seg_end <= recap_start:
                 continue  # Segment is entirely before recap
-            clipped_start = max(seg_start, last_recap['start'])
+            clipped_start = max(seg_start, recap_start)
             clipped_end = min(seg_end, total_video_duration)
             if clipped_start < clipped_end:
                 recap_keep_segments.append((clipped_start, clipped_end))
+        
+        print(f"[INFO] Filtered {len(recap_keep_segments)} keep_segments for recap: {[f'{s:.2f}-{e:.2f}' for s, e in recap_keep_segments]}")
         
         # Generate ASS with adjusted timestamps (relative to the concatenated video timeline)
         ass_path = Config.TEMP_DIR / "recap.ass"
@@ -103,7 +131,7 @@ class VideoRenderer:
             recap_sequence,
             str(ass_path),
             is_vertical=True,
-            start_offset=last_recap['start']
+            start_offset=recap_start
         )
         
         # Use concat_video_segments to remove silence gaps
@@ -119,7 +147,7 @@ class VideoRenderer:
         SubtitleRenderer.adjust_timestamps_for_concat(
             str(ass_path),
             recap_keep_segments,
-            last_recap['start']
+            recap_start
         )
         
         SubtitleRenderer.burn_subtitles(
@@ -143,8 +171,9 @@ class VideoRenderer:
             return
             
         print(f"\n--- Path 1.2: Rendering Clean Long-form ---")
-        recap_ranges = [(r['start'], r['end']) for r in recap_segments]
-        final_intervals = TimeMapper.get_clean_intervals(keep_segments, recap_ranges)
+        # FIX: Use keep_segments directly - it already contains main content + final recap segment
+        # No need to subtract recap_ranges since we WANT the recap in the clean video
+        final_intervals = keep_segments
         
         FFmpegWrapper.concat_video_segments(
             input_path=input_video,
@@ -197,22 +226,38 @@ class VideoRenderer:
                 temp_trim.unlink()
 
     @classmethod
-    def run(cls, input_video: str, master_index: List[dict], time_mapper, keep_segments: List[tuple]):
+    def run(cls, input_video: str, master_index: List[dict], time_mapper, keep_segments: List[tuple], final_recap_segment: Optional[Tuple[float, float]] = None):
+        """Main entry point for rendering."""
         print("--- Applying Logic Filters ---")
-        recap_segments = []
-        highlight_segments =[]
         
+        # Filter segments based on final_recap_segment (if provided)
+        if final_recap_segment:
+            recap_start, recap_end = final_recap_segment
+            # Find master_index segments that OVERLAP with the final recap segment
+            # Use overlap detection instead of strict containment to handle timestamp variations
+            # from VAD padding and TimeMapper offset calculations
+            recap_segments = [
+                seg for seg in master_index
+                if seg['start'] < recap_end and seg['end'] > recap_start
+            ]
+            print(f"[INFO] Found {len(recap_segments)} segments overlapping final recap section (time: {recap_start:.2f}s - {recap_end:.2f}s)")
+        else:
+            # Fallback to keyword-based detection if no recap segment provided
+            recap_segments = []
+            for seg in master_index:
+                text = seg['text'].lower()
+                if "recap" in text:
+                    if 'recap' not in seg['tags']:
+                        seg['tags'].append('recap')
+                    recap_segments.append(seg)
+            print(f"[INFO] Using keyword-based detection: {len(recap_segments)} recap segments found")
+        
+        # Detect highlights based on duration
+        highlight_segments = []
         for seg in master_index:
-            text = seg['text'].lower()
             duration = seg['end'] - seg['start']
-            
-            if "recap" in text:
-                if 'recap' not in seg['tags']:
-                    seg['tags'].append('recap')
-                recap_segments.append(seg)
-                
             if 5.0 < duration < 60.0:
-                score = 1 
+                score = 1
                 if score >= 1:
                     if 'highlight' not in seg['tags']:
                         seg['tags'].append('highlight')
@@ -220,6 +265,7 @@ class VideoRenderer:
                     
         cleanup_gpu()
 
-        cls.render_recap(input_video, recap_segments, master_index, time_mapper, keep_segments)
+        # Pass final_recap_segment to render_recap so it uses actual detected times
+        cls.render_recap(input_video, recap_segments, master_index, time_mapper, keep_segments, final_recap_segment)
         cls.render_clean_longform(input_video, time_mapper, keep_segments, recap_segments, master_index)
         cls.render_highlights(input_video, highlight_segments)

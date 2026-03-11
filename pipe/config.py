@@ -29,6 +29,32 @@ class Config:
     SAMPLE_RATE_WHISPER = 16000
     MIN_SILENCE_MS = 500
     LMM_MAX_TOKENS = 256
+    
+    # Clap Detection Settings (Multi-feature spectral analysis)
+    CLAP_DETECTION_ENABLED = True
+    
+    # Spectral thresholds
+    CLAP_SPECTRAL_CENTROID_THRESHOLD = 3000.0  # Hz - higher centroid = more high-freq content (claps >3kHz, speech <2.5kHz)
+    CLAP_HF_RATIO_THRESHOLD = 0.15             # High-frequency energy ratio (>4kHz), claps have broadband energy
+    
+    # Temporal thresholds
+    CLAP_CREST_FACTOR_THRESHOLD = 5.0          # Peak/RMS ratio for transient detection (claps >5, speech 2-4)
+    CLAP_MIN_DURATION_MS = 10                  # Minimum clap duration in ms
+    CLAP_MAX_DURATION_MS = 150                 # Maximum clap duration in ms
+    CLAP_ATTACK_TIME_MS = 8                    # Maximum attack time in ms (claps have rapid onset <8ms)
+    
+    # Classification threshold
+    CLAP_CONFIDENCE_THRESHOLD = 0.6            # Overall weighted score threshold for clap classification
+    # Note: Max possible score ~3.0 (sum of all feature weights)
+    
+    # Search parameters
+    CLAP_MAX_SEARCH_SEC = 60                   # Search window from end of video in seconds
+    CLAP_SILENCE_THRESHOLD = 0.01              # RMS below this is considered silence
+    CLAP_MIN_SILENCE_MS = 200                  # Minimum gap to count as "silence" between clap and speech
+    
+    # Fallback Settings (if no clap detected)
+    RECAP_KEYWORDS = ["recap", "review", "summary", "in this video", "let's go over", "to summarize"]
+    DEFAULT_RECAP_PERCENTAGE = 0.1             # Assume last 10% is recap if no clap found
 
     # Create dirs
     TEMP_DIR.mkdir(exist_ok=True)
